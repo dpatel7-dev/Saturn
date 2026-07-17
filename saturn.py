@@ -1,6 +1,6 @@
 """
-SATURN v1.2 — Groq-powered AI console for Google Colab
-======================================================
+SATURN — Groq-powered AI console for Google Colab
+=================================================
 Install & run — paste these two lines into any Colab cell:
 
     !wget -q https://dpatel7-dev.github.io/saturn/saturn.py -O saturn.py
@@ -11,18 +11,32 @@ Re-run the wizard anytime with the /setup command, or force it with:
 
     %run saturn.py setup
 
+AUTO-UPDATE: on every boot, Saturn checks GitHub for a newer copy of
+itself. If anything changed, it installs the new version and relaunches
+automatically with your saved settings. You can also trigger a check
+manually with the /update command.
+
 Settings are saved to /content/saturn_config.json for this runtime.
 Note: Colab wipes /content when the runtime resets, so for a permanent
 key, add GROQ_API_KEY in Colab Secrets (key icon in the left sidebar)
 and the wizard will find it automatically.
 """
 
-import os, sys, time, json, re, subprocess, urllib.request, urllib.parse
+import os, sys, time, json, re, subprocess, hashlib, urllib.request, urllib.parse
 from getpass import getpass
+from IPython import get_ipython
 
-SATURN_VERSION = '1.2'
+SATURN_VERSION = '1.4'
 REQUIRED_PACKAGES = ['groq', 'colorama']
 CONFIG_PATH = '/content/saturn_config.json'
+
+# Where Saturn looks for new versions of itself. It tries these in
+# order and uses the first one that responds. IMPORTANT: if you ever
+# rename your repo or GitHub username, update BOTH addresses here.
+UPDATE_URLS = [
+    'https://dpatel7-dev.github.io/saturn/saturn.py',
+    'https://raw.githubusercontent.com/dpatel7-dev/saturn/main/saturn.py',
+]
 
 DEFAULT_CONFIG = {
     'engine': '1',            # key into MODELS below
@@ -71,6 +85,72 @@ def _startup_install_packages():
 # imports below, otherwise they would fail on a fresh Colab runtime.
 _startup_check_colab()
 _startup_install_packages()
+
+# ────────────────────────────────────────────────────────────
+# AUTO-UPDATE
+# Compares this running file against the copy on GitHub.
+# Any committed change (even one character) triggers an update.
+# ────────────────────────────────────────────────────────────
+
+def _fetch_remote_saturn():
+    """Download the latest saturn.py from GitHub.
+    Returns (source_code, version) or (None, None) if unreachable."""
+    for base in UPDATE_URLS:
+        try:
+            # The ?nocache= part defeats GitHub's CDN cache so fresh
+            # commits are picked up quickly instead of minutes later.
+            url = base + '?nocache=' + str(int(time.time()))
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                src = r.read().decode('utf-8')
+            m = re.search(r"SATURN_VERSION\s*=\s*'([^']+)'", src)
+            # Sanity check: only accept files that really look like Saturn,
+            # so a 404 page or wrong file can never overwrite the script.
+            if m and 'def start_saturn_console' in src:
+                return src, m.group(1)
+        except Exception:
+            continue
+    return None, None
+
+def check_for_updates():
+    """Install + relaunch if GitHub has a different version.
+    Returns True if an update took over (caller should stop running)."""
+    label = '[saturn-update]'
+    local_path = os.path.abspath(globals().get('__file__', '/content/saturn.py'))
+    try:
+        with open(local_path, encoding='utf-8') as f:
+            local_src = f.read()
+    except Exception:
+        print(f'{label} ! Could not read local file, skipping update check.')
+        return False
+
+    remote_src, remote_ver = _fetch_remote_saturn()
+    if remote_src is None:
+        print(f'{label} ! Could not reach GitHub, skipping update check.')
+        return False
+
+    local_hash = hashlib.sha256(local_src.encode()).hexdigest()
+    remote_hash = hashlib.sha256(remote_src.encode()).hexdigest()
+    if local_hash == remote_hash:
+        print(f'{label} * Saturn is up to date (v{SATURN_VERSION})')
+        return False
+
+    print(f'{label} * Changes detected on GitHub (remote v{remote_ver}, running v{SATURN_VERSION})')
+    try:
+        with open(local_path, 'w', encoding='utf-8') as f:
+            f.write(remote_src)
+    except Exception as e:
+        print(f'{label} x Could not write the update: {e}')
+        return False
+
+    print(f'{label} * Update installed — relaunching with your saved settings ...\n')
+    os.environ['SATURN_JUST_UPDATED'] = '1'   # stops the new copy re-checking instantly
+    time.sleep(1.0)
+    try:
+        get_ipython().run_line_magic('run', local_path)
+    except Exception as e:
+        print(f'{label} ! Auto-relaunch failed ({e}). Re-run this cell to start v{remote_ver}.')
+    return True
 
 from colorama import Fore, Style, init
 init(strip=False, autoreset=True)
@@ -239,7 +319,7 @@ def dashboard(engine, temperature):
     print(Fore.WHITE + ' LATENCY PROFILE  ::', Fore.CYAN + str(M['lat']) + 's  |  SPEED: ' + str(M['spd']) + ' w/s')
     print(Fore.WHITE + ' OPERATIONS RUN   ::', Fore.YELLOW + str(M['run']) + ' tasks  |  ERRORS: ' + Fore.RED + str(M['err']))
     print(Fore.RED + Style.BRIGHT + BORDER)
-    print(Fore.LIGHTBLACK_EX + ' Commands: /status  /read  /clear  /engine <n>  /setup  exit\n')
+    print(Fore.LIGHTBLACK_EX + ' Commands: /status  /read  /clear  /engine <n>  /setup  /update  exit\n')
 
 def web_search(query):
     print(Fore.CYAN + f"[web] Searching: {query} ...")
@@ -283,22 +363,54 @@ def parse_json_safely(raw_text):
         return f"\n[Parser Warning]: Malformed data layout detected: {str(je)}"
 
 def get_notebook_cells():
+    """Read the live notebook using Colab's real 'get_ipynb' request."""
     try:
-        res = colab_message.blocking_request('get_notebook_cells', timeout_sec=5)
-        return [{'type': c.get('cell_type'), 'content': ''.join(c.get('source', ''))} for c in res.get('cells', [])]
+        res = colab_message.blocking_request('get_ipynb', request='', timeout_sec=30)
+        cells = res.get('ipynb', {}).get('cells', [])
+        parsed = []
+        for c in cells:
+            src = c.get('source', [])
+            if isinstance(src, list):
+                src = ''.join(src)
+            parsed.append({'type': c.get('cell_type'), 'content': src[:4000]})
+        return parsed
     except Exception as e: return f"Kernel error: {str(e)}"
 
+CELL_COUNTER = {'n': 0}
+
 def create_new_cell(cell_type, content):
-    if cell_type == 'code':
-        output.eval_js(f"google.colab.notebook.insertCode({json.dumps(content)})")
-    else: # markdown
-        output.eval_js(f"google.colab.notebook.insertText({json.dumps(content)})")
-    print(Fore.GREEN + f"[ok] New {cell_type} cell inserted below.")
+    """Prepare a ready-to-insert cell.
+
+    Colab has no supported API for inserting cells from Python (the output
+    area runs in a sandboxed frame), so Saturn does the next best thing:
+    it saves the content to a file and hands the user a one-line %load
+    command that pours it straight into a fresh cell.
+    """
+    CELL_COUNTER['n'] += 1
+    fname = f"/content/saturn_cell_{CELL_COUNTER['n']}.py"
+    body = content if cell_type == 'code' else '%%markdown\n' + content
+    try:
+        with open(fname, 'w') as f:
+            f.write(body)
+    except Exception as e:
+        print(Fore.RED + f"[error] Could not save cell file: {e}")
+        return
+    # Harmless bonus attempt: some Jupyter frontends honor this and
+    # insert the cell automatically. Colab may simply ignore it.
+    try:
+        get_ipython().set_next_input(body)
+    except Exception:
+        pass
+    print(Fore.WHITE + Style.BRIGHT + '-' * 18 + f' generated {cell_type} cell ' + '-' * 18)
+    print(Fore.CYAN + content)
+    print(Fore.WHITE + Style.BRIGHT + '-' * 56)
+    print(Fore.GREEN + f"[ok] Saved to {fname}")
+    print(Fore.YELLOW + f"     To insert it: add a new cell below and run:  %load {fname}")
 
 def append_autocomplete(text):
-    # This function uses the kernel's write_to_buffer for autocompletion
-    output.eval_js(f"google.colab.kernel.write_to_buffer({json.dumps(text)}, true)")
-    print(Fore.GREEN + "[ok] Text injected at cursor.")
+    # Colab's frontend has no cursor-injection API, so this now routes
+    # through the same reliable cell-preparation flow.
+    create_new_cell('code', text)
 
 def run_ui_tool(text):
     M['run'] += 1
@@ -323,9 +435,16 @@ def animate_logo():
         r"╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝"
     ]
     print(Fore.RED + Style.BRIGHT + BORDER)
+    sys.stdout.flush()
+    time.sleep(0.15)
     for line in logo_lines:
         print(Fore.RED + Style.BRIGHT + line)
+        sys.stdout.flush()
+        time.sleep(0.09)          # line-burst effect
     print(Fore.RED + Style.BRIGHT + BORDER + '\n')
+    print(Fore.LIGHTBLACK_EX + '           booting saturn v' + SATURN_VERSION + ' ...')
+    sys.stdout.flush()
+    time.sleep(1.4)               # hold so the logo is actually seen
 
 def start_saturn_console(api_key, config):
     client = Groq(api_key=api_key)
@@ -335,8 +454,7 @@ def start_saturn_console(api_key, config):
         "CRITICAL TOOL INSTRUCTIONS:\n"
         "- For real-time data like current weather, time, or dates: Use [TOOL:SEARCH=concise_query] and summarize the first relevant result *directly and completely*. Once a concise summary has been generated, *do not perform additional searches or re-evaluate the query* unless the user explicitly asks for more detail or a different query. Avoid diving into specific APIs or deep crawls unless explicitly asked.\n"
         "- Scrape specific web address/link directly: [TOOL:URL=://website.com]\n"
-        "- Create notebook cells: [CELL:code=content] or [CELL:text=content]\n"
-        "- Autocomplete active line cursor: [AUTOCOMPLETE=text]\n"
+        "- Prepare a new notebook cell for the user: [CELL:code=content] or [CELL:text=content]. Saturn displays the content and gives the user a one-line %load command to insert it into their notebook.\n"
         "- When generating code, explain your reasoning, follow Python best practices (e.g., clear variable names, comments for complex logic), and consider error handling.\n"
         "- If the user asks for code improvements or debugging, analyze the provided code and suggest specific modifications with explanations.\n"
         "- If the user asks for code to be fixed, analyze the provided code, identify the issue, and provide specific modifications with clear explanations, adhering to Python best practices.\n"
@@ -356,6 +474,10 @@ def start_saturn_console(api_key, config):
         inp = input().strip()
         if inp.lower() in ['exit', 'quit']: break
         if inp == '/status': output.clear(); dashboard(curr_model, config['temperature']); continue
+        if inp == '/update':
+            if check_for_updates():
+                return   # the new version ran and finished; retire this one
+            continue
         if inp == '/setup':
             output.clear()
             config, new_key = run_setup_wizard()
@@ -441,6 +563,14 @@ def start_saturn_console(api_key, config):
 
 def main():
     print(f'[saturn-startup] Booting Saturn v{SATURN_VERSION} ...')
+
+    # If this copy was just installed by the auto-updater, skip
+    # re-checking immediately (prevents any relaunch loops).
+    just_updated = os.environ.pop('SATURN_JUST_UPDATED', None)
+    if just_updated:
+        print('[saturn-startup] * Freshly updated — welcome to v' + SATURN_VERSION)
+    elif check_for_updates():
+        return   # a newer version installed itself and already ran
 
     # "%run saturn.py setup" forces the wizard even if settings exist
     force_setup = len(sys.argv) > 1 and sys.argv[1].lower() == 'setup'
